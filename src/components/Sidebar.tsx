@@ -64,13 +64,6 @@ function Sidebar() {
 
   useEffect(() => {
     const loadCurrentUser = async () => {
-      const normalizeName = (value?: string | null): string | undefined => {
-        if (!value) return undefined
-        const trimmed = value.trim()
-        if (!trimmed || trimmed.toLowerCase() === 'self') return undefined
-        return trimmed
-      }
-
       const patchUserProfile = (patch: Partial<SidebarUserProfile>, expectedWxid?: string) => {
         setUserProfile(prev => {
           if (expectedWxid && prev.wxid && prev.wxid !== expectedWxid) {
@@ -91,6 +84,32 @@ function Sidebar() {
       try {
         const wxid = await configService.getMyWxid()
         const resolvedWxid = wxid || ''
+        const cleanedWxidMatch = resolvedWxid.match(/^(wxid_[^_]+)/i)
+        const cleanedWxid = cleanedWxidMatch?.[1] || resolvedWxid
+        const wxidCandidates = new Set<string>([
+          resolvedWxid.trim().toLowerCase(),
+          cleanedWxid.trim().toLowerCase()
+        ].filter(Boolean))
+
+        const normalizeName = (value?: string | null): string | undefined => {
+          if (!value) return undefined
+          const trimmed = value.trim()
+          if (!trimmed) return undefined
+          const lowered = trimmed.toLowerCase()
+          if (lowered === 'self') return undefined
+          if (lowered.startsWith('wxid_')) return undefined
+          if (wxidCandidates.has(lowered)) return undefined
+          return trimmed
+        }
+
+        const pickFirstValidName = (...candidates: Array<string | null | undefined>): string | undefined => {
+          for (const candidate of candidates) {
+            const normalized = normalizeName(candidate)
+            if (normalized) return normalized
+          }
+          return undefined
+        }
+
         const fallbackDisplayName = resolvedWxid || '未识别用户'
 
         // 第一阶段：先把 wxid/名称打上，保证侧边栏第一时间可见。
@@ -105,20 +124,26 @@ function Sidebar() {
         void (async () => {
           try {
             const myContact = await window.electronAPI.chat.getContact(resolvedWxid)
-            const fromContact =
-              normalizeName(myContact?.remark) ||
-              normalizeName(myContact?.nickName) ||
-              normalizeName(myContact?.alias)
+            const fromContact = pickFirstValidName(
+              myContact?.remark,
+              myContact?.nickName,
+              myContact?.alias
+            )
 
             if (fromContact) {
               patchUserProfile({ displayName: fromContact }, resolvedWxid)
               return
             }
 
-            const enrichedResult = await window.electronAPI.chat.enrichSessionsContactInfo([resolvedWxid, 'self'])
-            const enrichedDisplayName = normalizeName(enrichedResult.contacts?.[resolvedWxid]?.displayName)
-            const fallbackSelfName = normalizeName(enrichedResult.contacts?.self?.displayName)
-            const bestName = enrichedDisplayName || fallbackSelfName
+            const enrichTargets = Array.from(new Set([resolvedWxid, cleanedWxid, 'self'].filter(Boolean)))
+            const enrichedResult = await window.electronAPI.chat.enrichSessionsContactInfo(enrichTargets)
+            const enrichedDisplayName = pickFirstValidName(
+              enrichedResult.contacts?.[resolvedWxid]?.displayName,
+              enrichedResult.contacts?.[cleanedWxid]?.displayName,
+              enrichedResult.contacts?.self?.displayName,
+              myContact?.alias
+            )
+            const bestName = enrichedDisplayName
             if (bestName) {
               patchUserProfile({ displayName: bestName }, resolvedWxid)
             }

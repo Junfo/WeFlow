@@ -3250,11 +3250,13 @@ class ChatService {
       if (!connectResult.success) return null
       const result = await wcdbService.getContact(username)
       if (!result.success || !result.contact) return null
+      const contact = result.contact as Record<string, any>
       return {
-        username: result.contact.username || username,
-        alias: result.contact.alias || '',
-        remark: result.contact.remark || '',
-        nickName: result.contact.nickName || ''
+        username: String(contact.username || contact.user_name || contact.userName || username || ''),
+        alias: String(contact.alias || contact.Alias || ''),
+        remark: String(contact.remark || contact.Remark || ''),
+        // 兼容不同表结构字段，避免 nick_name 丢失导致侧边栏退化到 wxid。
+        nickName: String(contact.nickName || contact.nick_name || contact.nickname || contact.NickName || '')
       }
     } catch {
       return null
