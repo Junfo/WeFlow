@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useLocation } from 'react-router-dom'
 import { useAppStore } from '../stores/appStore'
 import { useChatStore } from '../stores/chatStore'
 import { useThemeStore, themes } from '../stores/themeStore'
@@ -45,6 +46,7 @@ interface WxidOption {
 }
 
 function SettingsPage() {
+  const location = useLocation()
   const {
     isDbConnected,
     setDbConnected,
@@ -208,6 +210,12 @@ function SettingsPage() {
       Object.values(saveTimersRef.current).forEach((timer) => clearTimeout(timer))
     }
   }, [])
+
+  useEffect(() => {
+    const initialTab = (location.state as { initialTab?: SettingsTab } | null)?.initialTab
+    if (!initialTab) return
+    setActiveTab(initialTab)
+  }, [location.state])
 
   // 点击外部关闭下拉框
   useEffect(() => {

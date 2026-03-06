@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import { NavLink, useLocation } from 'react-router-dom'
-import { Home, MessageSquare, BarChart3, Users, FileText, Settings, ChevronLeft, ChevronRight, Download, Aperture, UserCircle, Lock, ChevronUp, Trash2 } from 'lucide-react'
+import { NavLink, useLocation, useNavigate } from 'react-router-dom'
+import { Home, MessageSquare, BarChart3, Users, FileText, Settings, ChevronLeft, ChevronRight, Download, Aperture, UserCircle, Lock, LockOpen, ChevronUp, Trash2 } from 'lucide-react'
 import { useAppStore } from '../stores/appStore'
 import * as configService from '../services/config'
 import { onExportSessionStatus, requestExportSessionStatus } from '../services/exportBridge'
@@ -64,6 +64,7 @@ const normalizeAccountId = (value?: string | null): string => {
 
 function Sidebar() {
   const location = useLocation()
+  const navigate = useNavigate()
   const [collapsed, setCollapsed] = useState(false)
   const [authEnabled, setAuthEnabled] = useState(false)
   const [activeExportTaskCount, setActiveExportTaskCount] = useState(0)
@@ -465,16 +466,20 @@ function Sidebar() {
           </div>
         </div>
 
-        {authEnabled && (
-          <button
-            className="nav-item"
-            onClick={() => setLocked(true)}
-            title={collapsed ? '锁定' : undefined}
-          >
-            <span className="nav-icon"><Lock size={20} /></span>
-            <span className="nav-label">锁定</span>
-          </button>
-        )}
+        <button
+          className="nav-item"
+          onClick={() => {
+            if (authEnabled) {
+              setLocked(true)
+              return
+            }
+            navigate('/settings', { state: { initialTab: 'security' } })
+          }}
+          title={collapsed ? (authEnabled ? '锁定' : '未锁定') : undefined}
+        >
+          <span className="nav-icon">{authEnabled ? <Lock size={20} /> : <LockOpen size={20} />}</span>
+          <span className="nav-label">{authEnabled ? '锁定' : '未锁定'}</span>
+        </button>
 
         <NavLink
           to="/settings"
