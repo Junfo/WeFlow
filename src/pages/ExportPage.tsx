@@ -5876,27 +5876,29 @@ function ExportPage() {
     return (
       <div className={`contact-row ${checked ? 'selected' : ''}`}>
         <div className="contact-item">
-          <div className="row-select-cell">
-            <button
-              className={`select-icon-btn ${checked ? 'checked' : ''}`}
-              type="button"
-              disabled={!canExport}
-              onClick={() => toggleSelectSession(contact.username)}
-              title={canExport ? (checked ? '取消选择' : '选择会话') : '该联系人暂无会话记录'}
-            >
-              {checked ? <CheckSquare size={16} /> : <Square size={16} />}
-            </button>
-          </div>
-          <div className="contact-avatar">
-            {contact.avatarUrl ? (
-              <img src={contact.avatarUrl} alt="" loading="lazy" />
-            ) : (
-              <span>{getAvatarLetter(contact.displayName)}</span>
-            )}
-          </div>
-          <div className="contact-info">
-            <div className="contact-name">{contact.displayName}</div>
-            <div className="contact-remark">{contact.alias || contact.username}</div>
+          <div className="row-left-sticky">
+            <div className="row-select-cell">
+              <button
+                className={`select-icon-btn ${checked ? 'checked' : ''}`}
+                type="button"
+                disabled={!canExport}
+                onClick={() => toggleSelectSession(contact.username)}
+                title={canExport ? (checked ? '取消选择' : '选择会话') : '该联系人暂无会话记录'}
+              >
+                {checked ? <CheckSquare size={16} /> : <Square size={16} />}
+              </button>
+            </div>
+            <div className="contact-avatar">
+              {contact.avatarUrl ? (
+                <img src={contact.avatarUrl} alt="" loading="lazy" />
+              ) : (
+                <span>{getAvatarLetter(contact.displayName)}</span>
+              )}
+            </div>
+            <div className="contact-info">
+              <div className="contact-name">{contact.displayName}</div>
+              <div className="contact-remark">{contact.alias || contact.username}</div>
+            </div>
           </div>
           <div className="row-message-count">
             <div className="row-message-stats">
@@ -6394,19 +6396,21 @@ function ExportPage() {
                         onPointerUp={handleContactsHeaderPointerUp}
                         onPointerCancel={handleContactsHeaderPointerCancel}
                       >
-                        <span className="contacts-list-header-select">
-                          <button
-                            className={`select-icon-btn ${isAllVisibleSelected ? 'checked' : ''}`}
-                            type="button"
-                            onClick={toggleSelectAllVisible}
-                            disabled={visibleSelectableCount === 0}
-                            title={isAllVisibleSelected ? '取消全选当前筛选联系人' : '全选当前筛选联系人'}
-                          >
-                            {isAllVisibleSelected ? <CheckSquare size={16} /> : <Square size={16} />}
-                          </button>
-                        </span>
-                        <span className="contacts-list-header-main">
-                          <span className="contacts-list-header-main-label">{contactsHeaderMainLabel}</span>
+                        <span className="contacts-list-header-left">
+                          <span className="contacts-list-header-select">
+                            <button
+                              className={`select-icon-btn ${isAllVisibleSelected ? 'checked' : ''}`}
+                              type="button"
+                              onClick={toggleSelectAllVisible}
+                              disabled={visibleSelectableCount === 0}
+                              title={isAllVisibleSelected ? '取消全选当前筛选联系人' : '全选当前筛选联系人'}
+                            >
+                              {isAllVisibleSelected ? <CheckSquare size={16} /> : <Square size={16} />}
+                            </button>
+                          </span>
+                          <span className="contacts-list-header-main">
+                            <span className="contacts-list-header-main-label">{contactsHeaderMainLabel}</span>
+                          </span>
                         </span>
                         <span className="contacts-list-header-count">总消息数</span>
                         <span className="contacts-list-header-media">表情包</span>
