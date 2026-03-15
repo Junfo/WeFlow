@@ -2620,60 +2620,88 @@ function ChatPage(props: ChatPageProps) {
   }
 
   // 会话内搜索
+  const inSessionSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const inSessionSearchGenRef = useRef(0)
   const handleInSessionSearch = useCallback(async (keyword: string) => {
     setInSessionQuery(keyword)
+    if (inSessionSearchTimerRef.current) clearTimeout(inSessionSearchTimerRef.current)
+    inSessionSearchGenRef.current += 1
     if (!keyword.trim() || !currentSessionId) {
       setInSessionResults([])
+      setInSessionSearching(false)
       return
     }
-    setInSessionSearching(true)
-    try {
-      const res = await window.electronAPI.chat.searchMessages(keyword.trim(), currentSessionId, 50, 0)
-      setInSessionResults(res?.messages || [])
-    } catch {
-      setInSessionResults([])
-    } finally {
-      setInSessionSearching(false)
-    }
+    const gen = inSessionSearchGenRef.current
+    const sid = currentSessionId
+    inSessionSearchTimerRef.current = setTimeout(async () => {
+      if (gen !== inSessionSearchGenRef.current) return
+      setInSessionSearching(true)
+      try {
+        const res = await window.electronAPI.chat.searchMessages(keyword.trim(), sid, 50, 0)
+        if (gen !== inSessionSearchGenRef.current) return
+        setInSessionResults(res?.messages || [])
+      } catch {
+        if (gen !== inSessionSearchGenRef.current) return
+        setInSessionResults([])
+      } finally {
+        if (gen === inSessionSearchGenRef.current) setInSessionSearching(false)
+      }
+    }, 500)
   }, [currentSessionId])
 
   const handleToggleInSessionSearch = useCallback(() => {
     setShowInSessionSearch(v => {
-      if (v) { setInSessionQuery(''); setInSessionResults([]) }
-      else setTimeout(() => inSessionSearchRef.current?.focus(), 50)
+      if (v) {
+        inSessionSearchGenRef.current += 1
+        if (inSessionSearchTimerRef.current) clearTimeout(inSessionSearchTimerRef.current)
+        setInSessionQuery('')
+        setInSessionResults([])
+        setInSessionSearching(false)
+      } else {
+        setTimeout(() => inSessionSearchRef.current?.focus(), 50)
+      }
       return !v
     })
   }, [])
 
   // 全局消息搜索
   const globalMsgSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const globalMsgSearchGenRef = useRef(0)
   const handleGlobalMsgSearch = useCallback(async (keyword: string) => {
     setGlobalMsgQuery(keyword)
     if (globalMsgSearchTimerRef.current) clearTimeout(globalMsgSearchTimerRef.current)
+    globalMsgSearchGenRef.current += 1
     if (!keyword.trim()) {
       setGlobalMsgResults([])
       setShowGlobalMsgSearch(false)
+      setGlobalMsgSearching(false)
       return
     }
     setShowGlobalMsgSearch(true)
+    const gen = globalMsgSearchGenRef.current
     globalMsgSearchTimerRef.current = setTimeout(async () => {
+      if (gen !== globalMsgSearchGenRef.current) return
       setGlobalMsgSearching(true)
       try {
         const res = await window.electronAPI.chat.searchMessages(keyword.trim(), undefined, 50, 0)
+        if (gen !== globalMsgSearchGenRef.current) return
         setGlobalMsgResults(res?.messages || [])
       } catch {
+        if (gen !== globalMsgSearchGenRef.current) return
         setGlobalMsgResults([])
       } finally {
-        setGlobalMsgSearching(false)
+        if (gen === globalMsgSearchGenRef.current) setGlobalMsgSearching(false)
       }
-    }, 400)
+    }, 500)
   }, [])
 
   const handleCloseGlobalMsgSearch = useCallback(() => {
+    globalMsgSearchGenRef.current += 1
+    if (globalMsgSearchTimerRef.current) clearTimeout(globalMsgSearchTimerRef.current)
     setShowGlobalMsgSearch(false)
     setGlobalMsgQuery('')
     setGlobalMsgResults([])
-    if (globalMsgSearchTimerRef.current) clearTimeout(globalMsgSearchTimerRef.current)
+    setGlobalMsgSearching(false)
   }, [])
 
   // 滚动加载更多 + 显示/隐藏回到底部按钮（优化：节流，避免频繁执行）
