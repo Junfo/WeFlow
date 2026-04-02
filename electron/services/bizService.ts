@@ -1,13 +1,10 @@
 import { join } from 'path'
 import { readdirSync, existsSync } from 'fs'
 import { wcdbService } from './wcdbService'
-import { dbPathService } from './dbPathService'
 import { ConfigService } from './config'
-import * as fzstd from 'fzstd'
-import { DOMParser } from '@xmldom/xmldom'
+import { chatService, Message } from './chatService'
 import { ipcMain } from 'electron'
 import { createHash } from 'crypto'
-import {ContactCacheService} from "./contactCacheService";
 
 export interface BizAccount {
   username: string
@@ -26,6 +23,7 @@ export interface BizMessage {
   url: string
   cover: string
   content_list: any[]
+  raw?: any // 调试用
 }
 
 export interface BizPayRecord {
@@ -41,329 +39,221 @@ export interface BizPayRecord {
 
 export class BizService {
   private configService: ConfigService
+
   constructor() {
     this.configService = new ConfigService()
   }
 
-  private getAccountDir(account?: string): string {
-    const root = dbPathService.getDefaultPath()
-    if (account) {
-      return join(root, account)
+  private extractXmlValue(xml: string, tagName: string): string {
+    const regex = new RegExp(`<${tagName}>([\\s\\S]*?)</${tagName}>`, 'i')
+    const match = regex.exec(xml)
+    if (match) {
+      return match[1].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim()
     }
-    // Default to the first scanned account if no account specified
-    const candidates = dbPathService.scanWxids(root)
-    if (candidates.length > 0) {
-      return join(root, candidates[0].wxid)
-    }
-    return root
+    return ''
   }
 
-  private decompressZstd(data: Buffer): string {
-    if (!data || data.length < 4) return data.toString('utf-8')
-    const magic = data.readUInt32LE(0)
-    if (magic !== 0xFD2FB528) {
-      return data.toString('utf-8')
-    }
+  private parseBizContentList(xmlStr: string): any[] {
+    if (!xmlStr) return []
+    const contentList: any[] = []
     try {
-      const decompressed = fzstd.decompress(data)
-      return Buffer.from(decompressed).toString('utf-8')
-    } catch (e) {
-      console.error('[BizService] Zstd decompression failed:', e)
-      return data.toString('utf-8')
-    }
-  }
-
-  private parseBizXml(xmlStr: string): any {
-    if (!xmlStr) return null
-    try {
-      const doc = new DOMParser().parseFromString(xmlStr, 'text/xml')
-      const q = (parent: any, selector: string) => {
-        const nodes = parent.getElementsByTagName(selector)
-        return nodes.length > 0 ? nodes[0].textContent || '' : ''
-      }
-
-      const appMsg = doc.getElementsByTagName('appmsg')[0]
-      if (!appMsg) return null
-
-      // 提取主封面
-      let mainCover = q(appMsg, 'thumburl')
-      if (!mainCover) {
-        const coverNode = doc.getElementsByTagName('cover')[0]
-        if (coverNode) mainCover = coverNode.textContent || ''
-      }
-
-      const result = {
-        title: q(appMsg, 'title'),
-        des: q(appMsg, 'des'),
-        url: q(appMsg, 'url'),
-        cover: mainCover,
-        content_list: [] as any[]
-      }
-
-      const items = doc.getElementsByTagName('item')
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i]
+      const itemRegex = /<item>([\s\S]*?)<\/item>/gi
+      let match: RegExpExecArray | null
+      while ((match = itemRegex.exec(xmlStr)) !== null) {
+        const itemXml = match[1]
         const itemStruct = {
-          title: q(item, 'title'),
-          url: q(item, 'url'),
-          cover: q(item, 'cover'),
-          summary: q(item, 'summary')
+          title: this.extractXmlValue(itemXml, 'title'),
+          url: this.extractXmlValue(itemXml, 'url'),
+          cover: this.extractXmlValue(itemXml, 'cover') || this.extractXmlValue(itemXml, 'thumburl'),
+          summary: this.extractXmlValue(itemXml, 'summary') || this.extractXmlValue(itemXml, 'digest')
         }
-        if (itemStruct.title) {
-          result.content_list.push(itemStruct)
-        }
+        if (itemStruct.title) contentList.push(itemStruct)
       }
-
-      return result
-    } catch (e) {
-      console.error('[BizService] XML parse failed:', e)
-      return null
-    }
+    } catch (e) {}
+    return contentList
   }
 
   private parsePayXml(xmlStr: string): any {
     if (!xmlStr) return null
     try {
-      const doc = new DOMParser().parseFromString(xmlStr, 'text/xml')
-      const q = (parent: any, selector: string) => {
-        const nodes = parent.getElementsByTagName(selector)
-        return nodes.length > 0 ? nodes[0].textContent || '' : ''
-      }
+      const title = this.extractXmlValue(xmlStr, 'title')
+      const description = this.extractXmlValue(xmlStr, 'des')
+      const merchantName = this.extractXmlValue(xmlStr, 'display_name') || '微信支付'
+      const merchantIcon = this.extractXmlValue(xmlStr, 'icon_url')
+      const pubTime = parseInt(this.extractXmlValue(xmlStr, 'pub_time') || '0')
+      if (!title && !description) return null
+      return { title, description, merchant_name: merchantName, merchant_icon: merchantIcon, timestamp: pubTime }
+    } catch (e) { return null }
+  }
 
-      const appMsg = doc.getElementsByTagName('appmsg')[0]
-      const header = doc.getElementsByTagName('template_header')[0]
-
-      const record = {
-        title: appMsg ? q(appMsg, 'title') : '',
-        description: appMsg ? q(appMsg, 'des') : '',
-        merchant_name: header ? q(header, 'display_name') : '微信支付',
-        merchant_icon: header ? q(header, 'icon_url') : '',
-        timestamp: parseInt(q(doc, 'pub_time') || '0'),
-        formatted_time: ''
-      }
-      return record
-    } catch (e) {
-      console.error('[BizService] Pay XML parse failed:', e)
-      return null
+  /**
+   * 核心：获取公众号消息，支持从 biz_message*.db 自动定位
+   */
+  private async getBizRawMessages(username: string, account: string, limit: number, offset: number): Promise<Message[]> {
+    console.log(`[BizService] getBizRawMessages: ${username}, offset=${offset}, limit=${limit}`)
+    
+    // 1. 首先尝试直接用 chatService.getMessages (如果 Native 层支持路由)
+    const chatRes = await chatService.getMessages(username, offset, limit)
+    if (chatRes.success && chatRes.messages && chatRes.messages.length > 0) {
+      console.log(`[BizService] chatService found ${chatRes.messages.length} messages for ${username}`)
+      return chatRes.messages
     }
+
+    // 2. 如果 chatService 没找到，手动扫描 biz_message*.db (类似 Python 逻辑)
+    console.log(`[BizService] chatService empty, manual scanning biz_message*.db...`)
+    const root = this.configService.get('dbPath')
+    const accountWxid = account || this.configService.get('myWxid')
+    if (!root || !accountWxid) return []
+
+    const dbDir = join(root, accountWxid, 'db_storage', 'message')
+    if (!existsSync(dbDir)) return []
+
+    const md5Id = createHash('md5').update(username).digest('hex').toLowerCase()
+    const tableName = `Msg_${md5Id}`
+    const bizDbFiles = readdirSync(dbDir).filter(f => f.startsWith('biz_message') && f.endsWith('.db'))
+
+    for (const file of bizDbFiles) {
+      const dbPath = join(dbDir, file)
+      // 检查表是否存在
+      const checkRes = await wcdbService.execQuery('message', dbPath, `SELECT name FROM sqlite_master WHERE type='table' AND lower(name)='${tableName}'`)
+      if (checkRes.success && checkRes.rows && checkRes.rows.length > 0) {
+        console.log(`[BizService] Found table ${tableName} in ${file}`)
+        // 分页查询原始行
+        const sql = `SELECT * FROM ${tableName} ORDER BY create_time DESC LIMIT ${limit} OFFSET ${offset}`
+        const queryRes = await wcdbService.execQuery('message', dbPath, sql)
+        if (queryRes.success && queryRes.rows) {
+          // *** 复用 chatService 的解析逻辑 ***
+          return chatService.mapRowsToMessagesForApi(queryRes.rows)
+        }
+      }
+    }
+
+    return []
   }
 
   async listAccounts(account?: string): Promise<BizAccount[]> {
-    const root = this.configService.get('dbPath')
-    console.log(root)
-    let accountWxids: string[] = []
-    
-    if (account) {
-      accountWxids = [account]
-    } else {
-      const candidates = dbPathService.scanWxids(root)
-      accountWxids = candidates.map(c => c.wxid)
-    }
+    try {
+      const contactsResult = await chatService.getContacts({ lite: true })
+      if (!contactsResult.success || !contactsResult.contacts) return []
 
-    const allBizAccounts: Record<string, BizAccount> = {}
+      const officialContacts = contactsResult.contacts.filter(c => c.type === 'official')
+      const usernames = officialContacts.map(c => c.username)
+      const enrichment = await chatService.enrichSessionsContactInfo(usernames)
+      const contactInfoMap = enrichment.success && enrichment.contacts ? enrichment.contacts : {}
 
-    for (const wxid of accountWxids) {
-      const accountDir = join(root, wxid)
-      const dbDir = join(accountDir, 'db_storage', 'message')
-      if (!existsSync(dbDir)) continue
+      const root = this.configService.get('dbPath')
+      const myWxid = this.configService.get('myWxid')
+      const accountWxid = account || myWxid
+      if (!root || !accountWxid) return []
 
-      const bizDbFiles = readdirSync(dbDir).filter(f => f.startsWith('biz_message') && f.endsWith('.db'))
-      if (bizDbFiles.length === 0) continue
-
-      const bizIds = new Set<string>()
+      const dbDir = join(root, accountWxid, 'db_storage', 'message')
       const bizLatestTime: Record<string, number> = {}
 
-      for (const file of bizDbFiles) {
-        const dbPath = join(dbDir, file)
-        console.log(`path: ${dbPath}`)
-        const name2idRes = await wcdbService.execQuery('biz', dbPath, 'SELECT username FROM Name2Id')
-        console.log(`name2idRes success: ${name2idRes.success}`)
-        console.log(`name2idRes length: ${name2idRes.rows?.length}`)
-
-        if (name2idRes.success && name2idRes.rows) {
-          for (const row of name2idRes.rows) {
-            if (row.username) {
-              const uname = row.username
-              bizIds.add(uname)
-
-              const md5Id = createHash('md5').update(uname).digest('hex').toLowerCase()
-              const tableName = `Msg_${md5Id}`
-              const timeRes = await wcdbService.execQuery('biz', dbPath, `SELECT MAX(create_time) as max_time FROM ${tableName}`)
-              if (timeRes.success && timeRes.rows && timeRes.rows[0]?.max_time) {
-                const t = timeRes.rows[0].max_time
-                bizLatestTime[uname] = Math.max(bizLatestTime[uname] || 0, t)
+      if (existsSync(dbDir)) {
+        const bizDbFiles = readdirSync(dbDir).filter(f => f.startsWith('biz_message') && f.endsWith('.db'))
+        for (const file of bizDbFiles) {
+          const dbPath = join(dbDir, file)
+          const name2idRes = await wcdbService.execQuery('message', dbPath, 'SELECT username FROM Name2Id')
+          if (name2idRes.success && name2idRes.rows) {
+            for (const row of name2idRes.rows) {
+              const uname = row.username || row.user_name
+              if (uname) {
+                const md5 = createHash('md5').update(uname).digest('hex').toLowerCase()
+                const tName = `Msg_${md5}`
+                const timeRes = await wcdbService.execQuery('message', dbPath, `SELECT MAX(create_time) as max_time FROM ${tName}`)
+                if (timeRes.success && timeRes.rows && timeRes.rows[0]?.max_time) {
+                  const t = parseInt(timeRes.rows[0].max_time)
+                  if (!isNaN(t)) bizLatestTime[uname] = Math.max(bizLatestTime[uname] || 0, t)
+                }
               }
             }
           }
         }
       }
 
-      if (bizIds.size === 0) continue
+      const result: BizAccount[] = officialContacts.map(contact => {
+        const uname = contact.username
+        const info = contactInfoMap[uname]
+        const lastTime = bizLatestTime[uname] || 0
+        return {
+          username: uname,
+          name: info?.displayName || contact.displayName || uname,
+          avatar: info?.avatarUrl || '',
+          type: 0, 
+          last_time: lastTime,
+          formatted_last_time: lastTime ? new Date(lastTime * 1000).toISOString().split('T')[0] : ''
+        }
+      })
 
-      const contactDbPath = join(accountDir, 'contact.db')
+      const contactDbPath = join(root, accountWxid, 'contact.db')
       if (existsSync(contactDbPath)) {
-        const idsArray = Array.from(bizIds)
-        const batchSize = 100
-        for (let i = 0; i < idsArray.length; i += batchSize) {
-          const batch = idsArray.slice(i, i + batchSize)
-          const placeholders = batch.map(() => '?').join(',')
-          
-          const contactRes = await wcdbService.execQuery('contact', contactDbPath, 
-            `SELECT username, remark, nick_name, alias, big_head_url FROM contact WHERE username IN (${placeholders})`,
-            batch
-          )
-
-          if (contactRes.success && contactRes.rows) {
-            for (const r of contactRes.rows) {
-              const uname = r.username
-              const name = r.remark || r.nick_name || r.alias || uname
-              allBizAccounts[uname] = {
-                username: uname,
-                name: name,
-                avatar: r.big_head_url,
-                type: 3,
-                last_time: Math.max(allBizAccounts[uname]?.last_time || 0, bizLatestTime[uname] || 0),
-                formatted_last_time: ''
-              }
-            }
-          }
-
-          const bizInfoRes = await wcdbService.execQuery('biz', contactDbPath,
-            `SELECT username, type FROM biz_info WHERE username IN (${placeholders})`,
-            batch
-          )
-          if (bizInfoRes.success && bizInfoRes.rows) {
-            for (const r of bizInfoRes.rows) {
-              if (allBizAccounts[r.username]) {
-                allBizAccounts[r.username].type = r.type
-              }
-            }
-          }
+        const bizInfoRes = await wcdbService.execQuery('contact', contactDbPath, 'SELECT username, type FROM biz_info')
+        if (bizInfoRes.success && bizInfoRes.rows) {
+          const typeMap: Record<string, number> = {}
+          for (const r of bizInfoRes.rows) typeMap[r.username] = r.type
+          for (const acc of result) if (typeMap[acc.username] !== undefined) acc.type = typeMap[acc.username]
         }
       }
-    }
 
-    const result = Object.values(allBizAccounts).map(acc => ({
-      ...acc,
-      formatted_last_time: acc.last_time ? new Date(acc.last_time * 1000).toISOString().split('T')[0] : ''
-    })).sort((a, b) => {
-      // 微信支付强制置顶
-      if (a.username === 'gh_3dfda90e39d6') return -1
-      if (b.username === 'gh_3dfda90e39d6') return 1
-      return b.last_time - a.last_time
-    })
-
-    return result
-  }
-
-  private async getMsgContentBuf(messageContent: any): Promise<Buffer | null> {
-    if (typeof messageContent === 'string') {
-      if (messageContent.length > 0 && /^[0-9a-fA-F]+$/.test(messageContent)) {
-        return Buffer.from(messageContent, 'hex')
-      }
-      return Buffer.from(messageContent, 'utf-8')
-    } else if (messageContent && messageContent.data) {
-      return Buffer.from(messageContent.data)
-    } else if (Buffer.isBuffer(messageContent) || messageContent instanceof Uint8Array) {
-      return Buffer.from(messageContent)
-    }
-    return null
+      return result.sort((a, b) => {
+        if (a.username === 'gh_3dfda90e39d6') return -1
+        if (b.username === 'gh_3dfda90e39d6') return 1
+        return b.last_time - a.last_time
+      })
+    } catch (e) { return [] }
   }
 
   async listMessages(username: string, account?: string, limit: number = 20, offset: number = 0): Promise<BizMessage[]> {
-    const accountDir = this.getAccountDir(account)
-    const md5Id = createHash('md5').update(username).digest('hex').toLowerCase()
-    const tableName = `Msg_${md5Id}`
-    const dbDir = join(accountDir, 'db_storage')
-
-    if (!existsSync(dbDir)) return []
-    const files = readdirSync(dbDir).filter(f => f.startsWith('biz_message') && f.endsWith('.db'))
-    let targetDb: string | null = null
-
-    for (const file of files) {
-      const dbPath = join(dbDir, file)
-      const checkRes = await wcdbService.execQuery('biz', dbPath, `SELECT name FROM sqlite_master WHERE type='table' AND lower(name)='${tableName}'`)
-      if (checkRes.success && checkRes.rows && checkRes.rows.length > 0) {
-        targetDb = dbPath
-        break
-      }
-    }
-
-    if (!targetDb) return []
-
-    const msgRes = await wcdbService.execQuery('biz', targetDb, 
-      `SELECT local_id, create_time, message_content FROM ${tableName} WHERE local_type != 1 ORDER BY create_time DESC LIMIT ${limit} OFFSET ${offset}`
-    )
-
-    const messages: BizMessage[] = []
-    if (msgRes.success && msgRes.rows) {
-      for (const row of msgRes.rows) {
-        const contentBuf = await this.getMsgContentBuf(row.message_content)
-        if (!contentBuf) continue
-
-        const xmlStr = this.decompressZstd(contentBuf)
-        const structData = this.parseBizXml(xmlStr)
-        if (structData) {
-          messages.push({
-            local_id: row.local_id,
-            create_time: row.create_time,
-            ...structData
-          })
+    console.log(`[BizService] listMessages: ${username}, limit=${limit}, offset=${offset}`)
+    try {
+      const rawMessages = await this.getBizRawMessages(username, account || '', limit, offset)
+      
+      const bizMessages: BizMessage[] = rawMessages.map(msg => {
+        const bizMsg: BizMessage = {
+          local_id: msg.localId,
+          create_time: msg.createTime,
+          title: msg.linkTitle || msg.parsedContent || '',
+          des: msg.appMsgDesc || '',
+          url: msg.linkUrl || '',
+          cover: msg.linkThumb || msg.appMsgThumbUrl || '',
+          content_list: []
         }
-      }
+        if (msg.rawContent) {
+          bizMsg.content_list = this.parseBizContentList(msg.rawContent)
+          if (bizMsg.content_list.length > 0 && !bizMsg.title) {
+            bizMsg.title = bizMsg.content_list[0].title
+            bizMsg.cover = bizMsg.cover || bizMsg.content_list[0].cover
+          }
+        }
+        return bizMsg
+      })
+      return bizMessages
+    } catch (e) {
+      console.error(`[BizService] listMessages error:`, e)
+      return []
     }
-
-    return messages
   }
 
   async listPayRecords(account?: string, limit: number = 20, offset: number = 0): Promise<BizPayRecord[]> {
-    const username = 'gh_3dfda90e39d6' // 硬编码的微信支付账号
-    const accountDir = this.getAccountDir(account)
-    const md5Id = createHash('md5').update(username).digest('hex').toLowerCase()
-    const tableName = `Msg_${md5Id}`
-    const dbDir = join(accountDir, 'db_storage')
-
-    if (!existsSync(dbDir)) return []
-    const files = readdirSync(dbDir).filter(f => f.startsWith('biz_message') && f.endsWith('.db'))
-    let targetDb: string | null = null
-
-    for (const file of files) {
-      const dbPath = join(dbDir, file)
-      const checkRes = await wcdbService.execQuery('biz', dbPath, `SELECT name FROM sqlite_master WHERE type='table' AND lower(name)='${tableName}'`)
-      if (checkRes.success && checkRes.rows && checkRes.rows.length > 0) {
-        targetDb = dbPath
-        break
-      }
-    }
-
-    if (!targetDb) return []
-
-    const msgRes = await wcdbService.execQuery('biz', targetDb, 
-      `SELECT local_id, create_time, message_content FROM ${tableName} WHERE local_type = 21474836529 OR local_type != 1 ORDER BY create_time DESC LIMIT ${limit} OFFSET ${offset}`
-    )
-
-    const records: BizPayRecord[] = []
-    if (msgRes.success && msgRes.rows) {
-      for (const row of msgRes.rows) {
-        const contentBuf = await this.getMsgContentBuf(row.message_content)
-        if (!contentBuf) continue
-
-        const xmlStr = this.decompressZstd(contentBuf)
-        const parsedData = this.parsePayXml(xmlStr)
+    const username = 'gh_3dfda90e39d6'
+    try {
+      const rawMessages = await this.getBizRawMessages(username, account || '', limit, offset)
+      const records: BizPayRecord[] = []
+      for (const msg of rawMessages) {
+        if (!msg.rawContent) continue
+        const parsedData = this.parsePayXml(msg.rawContent)
         if (parsedData) {
-          const timestamp = parsedData.timestamp || row.create_time
           records.push({
-            local_id: row.local_id,
-            create_time: row.create_time,
+            local_id: msg.localId,
+            create_time: msg.createTime,
             ...parsedData,
-            timestamp,
-            formatted_time: new Date(timestamp * 1000).toLocaleString()
+            timestamp: parsedData.timestamp || msg.createTime,
+            formatted_time: new Date((parsedData.timestamp || msg.createTime) * 1000).toLocaleString()
           })
         }
       }
-    }
-
-    return records
+      return records
+    } catch (e) { return [] }
   }
 
   registerHandlers() {
