@@ -62,10 +62,18 @@ interface ConfigSchema {
   quoteLayout: 'quote-top' | 'quote-bottom'
   wordCloudExcludeWords: string[]
   exportWriteLayout: 'A' | 'B' | 'C'
+
+  // AI 见解
+  aiInsightEnabled: boolean
+  aiInsightApiBaseUrl: string
+  aiInsightApiKey: string
+  aiInsightApiModel: string
+  aiInsightSilenceDays: number
+  aiInsightAllowContext: boolean
 }
 
 // 需要 safeStorage 加密的字段（普通模式）
-const ENCRYPTED_STRING_KEYS: Set<string> = new Set(['decryptKey', 'imageAesKey', 'authPassword', 'httpApiToken'])
+const ENCRYPTED_STRING_KEYS: Set<string> = new Set(['decryptKey', 'imageAesKey', 'authPassword', 'httpApiToken', 'aiInsightApiKey'])
 const ENCRYPTED_BOOL_KEYS: Set<string> = new Set(['authEnabled', 'authUseHello'])
 const ENCRYPTED_NUMBER_KEYS: Set<string> = new Set(['imageXorKey'])
 
@@ -135,7 +143,13 @@ export class ConfigService {
       windowCloseBehavior: 'ask',
       quoteLayout: 'quote-top',
       wordCloudExcludeWords: [],
-      exportWriteLayout: 'A'
+      exportWriteLayout: 'A',
+      aiInsightEnabled: false,
+      aiInsightApiBaseUrl: '',
+      aiInsightApiKey: '',
+      aiInsightApiModel: 'gpt-4o-mini',
+      aiInsightSilenceDays: 3,
+      aiInsightAllowContext: false
     }
 
     const storeOptions: any = {

@@ -79,7 +79,15 @@ export const CONFIG_KEYS = {
 
   // 数据收集
   ANALYTICS_CONSENT: 'analyticsConsent',
-  ANALYTICS_DENY_COUNT: 'analyticsDenyCount'
+  ANALYTICS_DENY_COUNT: 'analyticsDenyCount',
+
+  // AI 见解
+  AI_INSIGHT_ENABLED: 'aiInsightEnabled',
+  AI_INSIGHT_API_BASE_URL: 'aiInsightApiBaseUrl',
+  AI_INSIGHT_API_KEY: 'aiInsightApiKey',
+  AI_INSIGHT_API_MODEL: 'aiInsightApiModel',
+  AI_INSIGHT_SILENCE_DAYS: 'aiInsightSilenceDays',
+  AI_INSIGHT_ALLOW_CONTEXT: 'aiInsightAllowContext'
 } as const
 
 export interface WxidConfig {
@@ -1550,4 +1558,60 @@ export async function getHttpApiHost(): Promise<string> {
 
 export async function setHttpApiHost(host: string): Promise<void> {
   await config.set(CONFIG_KEYS.HTTP_API_HOST, host)
+}
+
+// ─── AI 见解 ──────────────────────────────────────────────────────────────────
+
+export async function getAiInsightEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_ENABLED)
+  return value === true
+}
+
+export async function setAiInsightEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_ENABLED, enabled)
+}
+
+export async function getAiInsightApiBaseUrl(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_API_BASE_URL)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiInsightApiBaseUrl(url: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_API_BASE_URL, url)
+}
+
+export async function getAiInsightApiKey(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_API_KEY)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiInsightApiKey(key: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_API_KEY, key)
+}
+
+export async function getAiInsightApiModel(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_API_MODEL)
+  return typeof value === 'string' && value.trim() ? value.trim() : 'gpt-4o-mini'
+}
+
+export async function setAiInsightApiModel(model: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_API_MODEL, model)
+}
+
+export async function getAiInsightSilenceDays(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_SILENCE_DAYS)
+  return typeof value === 'number' && value > 0 ? value : 3
+}
+
+export async function setAiInsightSilenceDays(days: number): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_SILENCE_DAYS, days)
+}
+
+export async function getAiInsightAllowContext(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_ALLOW_CONTEXT)
+  return value === true
+}
+
+export async function setAiInsightAllowContext(allow: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_ALLOW_CONTEXT, allow)
 }
