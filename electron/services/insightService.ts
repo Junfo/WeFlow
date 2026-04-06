@@ -216,9 +216,12 @@ class InsightService {
    * 首次调用时填充，此后只在沉默扫描里刷新（沉默扫描间隔更长，更合适做全量刷新）。
    */
   private sessionCache: ChatSession[] | null = null
-  /** sessionCache 最后刷新时间戳（ms），超过 5 分钟强制重新拉取 */
+  /** sessionCache 最后刷新时间戳（ms），超过 15 分钟强制重新拉取 */
   private sessionCacheAt = 0
-  private static readonly SESSION_CACHE_TTL_MS = 5 * 60 * 1000
+  /** 缓存 TTL 设为 15 分钟，大幅减少 connect() + getSessions() 调用频率 */
+  private static readonly SESSION_CACHE_TTL_MS = 15 * 60 * 1000
+  /** 数据库是否已连接（避免重复调用 chatService.connect()） */
+  private dbConnected = false
 
   private started = false
 
@@ -237,6 +240,9 @@ class InsightService {
 
   stop(): void {
     this.started = false
+    this.dbConnected = false
+    this.sessionCache = null
+    this.sessionCacheAt = 0
     if (this.dbDebounceTimer !== null) {
       clearTimeout(this.dbDebounceTimer)
       this.dbDebounceTimer = null
@@ -254,11 +260,14 @@ class InsightService {
 
   /**
    * 由 main.ts 在 addDbMonitorListener 回调中调用。
-   * 加入 500ms 防抖，防止开机/重连时大量事件并发阻塞主线程。
+   * 加入 2s 防抖，防止开机/重连时大量事件并发阻塞主线程。
+   * 如果当前正在处理中，直接忽略此次事件（不创建新的 timer），避免 timer 堆积。
    */
   handleDbMonitorChange(_type: string, _json: string): void {
     if (!this.started) return
     if (!this.isEnabled()) return
+    // 正在处理时忽略新事件，避免 timer 堆积
+    if (this.processing) return
 
     if (this.dbDebounceTimer !== null) {
       clearTimeout(this.dbDebounceTimer)
@@ -371,7 +380,7 @@ class InsightService {
   }
 
   /**
-   * 获取会话列表，优先使用缓存（5 分钟 TTL）。
+   * 获取会话列表，优先使用缓存（15 分钟 TTL）。
    * 缓存命中时完全跳过数据库访问，避免频繁 connect() + getSessions() 消耗 CPU。
    * forceRefresh=true 时强制重新拉取（仅用于沉默扫描等低频场景）。
    */
@@ -387,10 +396,14 @@ class InsightService {
     }
     // 缓存未命中或强制刷新：连接数据库并拉取
     try {
-      const connectResult = await chatService.connect()
-      if (!connectResult.success) {
-        insightLog('WARN', '数据库连接失败，使用旧缓存')
-        return this.sessionCache ?? []
+      // 只在首次或强制刷新时调用 connect()，避免重复建立连接
+      if (!this.dbConnected || forceRefresh) {
+        const connectResult = await chatService.connect()
+        if (!connectResult.success) {
+          insightLog('WARN', '数据库连接失败，使用旧缓存')
+          return this.sessionCache ?? []
+        }
+        this.dbConnected = true
       }
       const result = await chatService.getSessions()
       if (result.success && result.sessions) {
@@ -399,6 +412,8 @@ class InsightService {
       }
     } catch (e) {
       insightLog('WARN', `获取会话缓存失败: ${(e as Error).message}`)
+      // 连接可能已断开，下次强制重连
+      this.dbConnected = false
     }
     return this.sessionCache ?? []
   }
