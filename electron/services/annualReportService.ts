@@ -170,7 +170,7 @@ class AnnualReportService {
     const rows = sessionResult.sessions as Record<string, any>[]
 
     const excludeList = [
-      'weixin', 'qqmail', 'fmessage', 'medianote', 'floatbottle',
+      'qqmail', 'fmessage', 'medianote', 'floatbottle',
       'newsapp', 'brandsessionholder', 'brandservicesessionholder',
       'notifymessage', 'opencustomerservicemsg', 'notification_messages',
       'userexperience_alarm', 'helper_folders', 'placeholder_foldgroup',
@@ -185,6 +185,7 @@ class AnnualReportService {
         if (username === 'filehelper') return false
         if (username.startsWith('gh_')) return false
         if (username.toLowerCase() === cleanedWxid.toLowerCase()) return false
+        if (username.toLowerCase() === 'weixin') return false
 
         for (const prefix of excludeList) {
           if (username.startsWith(prefix) || username === prefix) return false

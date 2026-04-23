@@ -428,6 +428,9 @@ class ChatService {
   private contactExtendedSelectableColumns: string[] | null = null
   private contactLabelNameMapCache: Map<number, string> | null = null
   private contactLabelNameMapCacheAt = 0
+  private readonly visibilityAnomalyLogWindowMs = 30000
+  private readonly visibilityAnomalyLogBurst = 3
+  private visibilityAnomalyLogState = new Map<string, { windowStart: number; total: number; suppressed: number }>()
   private readonly contactLabelNameMapCacheTtlMs = 10 * 60 * 1000
   private contactsLoadInFlight: { mode: 'lite' | 'full'; promise: Promise<{ success: boolean; contacts?: ContactInfo[]; error?: string }> } | null = null
   private contactsMemoryCache = new Map<'lite' | 'full', { scope: string; updatedAt: number; contacts: ContactInfo[] }>()
@@ -480,7 +483,7 @@ class ChatService {
     return true
   }
 
-  private extractErrorCode(message?: string): number | null {
+  private extractErrorCode(message?: string | null): number | null {
     const text = String(message || '').trim()
     if (!text) return null
     const match = text.match(/(?:错误码\s*[:：]\s*|\()(-?\d{2,6})(?:\)|\b)/)
@@ -804,6 +807,20 @@ class ChatService {
         return { success: false, error: `会话表异常: ${detail}${tableInfo}${tables}${columns}` }
       }
 
+      const openimLocalTypeMap = await this.loadContactLocalTypeMapForEnterpriseOpenim(rows.map((row) =>
+        String(
+          row.username ||
+          row.user_name ||
+          row.userName ||
+          row.usrName ||
+          row.UsrName ||
+          row.talker ||
+          row.talker_id ||
+          row.talkerId ||
+          ''
+        ).trim()
+      ))
+
       // 转换为 ChatSession（先加载缓存，但不等待额外状态查询）
       const sessions: ChatSession[] = []
       const now = Date.now()
@@ -821,7 +838,11 @@ class ChatService {
           row.talkerId ||
           ''
 
-        if (!this.shouldKeepSession(username)) continue
+        let sessionLocalType = this.getSessionLocalType(row)
+        if (!Number.isFinite(sessionLocalType) && this.isEnterpriseOpenimUsername(username)) {
+          sessionLocalType = openimLocalTypeMap.get(username)
+        }
+        if (!this.shouldKeepSession(username, sessionLocalType)) continue
 
         const sortTs = parseInt(
           row.sort_timestamp ||
@@ -921,13 +942,19 @@ class ChatService {
 
       for (const row of contactResult.contacts as Record<string, any>[]) {
         const username = String(row.username || '').trim()
-        if (!username.startsWith('gh_') || existing.has(username)) continue
+        if (!username || existing.has(username)) continue
+        const lowered = username.toLowerCase()
+        const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], Number.NaN)
+        const isOfficial = username.startsWith('gh_')
+        const isSpecialWeixin = lowered.startsWith('weixin') && lowered !== 'weixin'
+        const isSpecialOpenim = this.isAllowedEnterpriseOpenimByLocalType(username, localType)
+        if (!isOfficial && !isSpecialWeixin && !isSpecialOpenim) continue
 
         sessions.push({
           username,
           type: 0,
           unreadCount: 0,
-          summary: '查看公众号历史消息',
+          summary: isOfficial ? '查看公众号历史消息' : '暂无会话记录',
           sortTimestamp: 0,
           lastTimestamp: 0,
           lastMsgType: 0,
@@ -1875,11 +1902,21 @@ class ChatService {
         let type: 'friend' | 'group' | 'official' | 'former_friend' | 'other' = 'other'
         const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], 0)
         const quanPin = String(this.getRowField(row, ['quan_pin', 'quanPin', 'WCDB_CT_quan_pin']) || '').trim()
+        const loweredUsername = username.toLowerCase()
+        const isOpenimEnterprise = this.isEnterpriseOpenimUsername(username)
+        if (isOpenimEnterprise && !this.isAllowedEnterpriseOpenimByLocalType(username, localType)) {
+          continue
+        }
+        const isVisibleWeixinContact = loweredUsername.startsWith('weixin') && loweredUsername !== 'weixin'
 
         if (username.endsWith('@chatroom')) {
           type = 'group'
         } else if (username.startsWith('gh_')) {
           type = 'official'
+        } else if (isOpenimEnterprise) {
+          type = 'friend'
+        } else if (isVisibleWeixinContact) {
+          type = 'friend'
         } else if (localType === 1 && !FRIEND_EXCLUDE_USERNAMES.has(username)) {
           type = 'friend'
         } else if (localType === 0 && quanPin) {
@@ -1965,7 +2002,7 @@ class ChatService {
         return { success: false, error: connectResult.error || '数据库未连接' }
       }
 
-      const batchSize = Math.max(1, limit || this.messageBatchDefault)
+      const requestLimit = Math.max(1, Math.floor(limit || this.messageBatchDefault))
 
       // 使用互斥锁保护游标状态访问
       while (this.messageCursorMutex) {
@@ -1988,13 +2025,14 @@ class ChatService {
 
       // 只在以下情况重新创建游标:
       // 1. 没有游标状态
-      // 2. offset 为 0 (重新加载会话)
-      // 3. batchSize 改变
-      // 4. startTime/endTime 改变（视为全新查询）
-      // 5. ascending 改变
+      // 2. offset 变化导致游标位置不一致
+      // 3. startTime/endTime 改变（视为全新查询）
+      // 4. ascending 改变
+      //
+      // 注意：requestLimit 允许动态变化（前端可按“越往上拉批次越大”策略请求），
+      // 不应触发游标重建，否则会造成额外 reopen/skip 开销与抖动。
       const needNewCursor = !state ||
         offset !== state.fetched || // Offset mismatch -> must reset cursor
-        state.batchSize !== batchSize ||
         state.startTime !== startTime ||
         state.endTime !== endTime ||
         state.ascending !== ascending
@@ -2011,15 +2049,16 @@ class ChatService {
 
         // 创建新游标
         // 注意：WeFlow 数据库中的 create_time 是以秒为单位的
+        const cursorBatchSize = Math.max(1, Math.floor(state?.batchSize || requestLimit || this.messageBatchDefault))
         const beginTimestamp = startTime > 10000000000 ? Math.floor(startTime / 1000) : startTime
         const endTimestamp = endTime > 10000000000 ? Math.floor(endTime / 1000) : endTime
-        const cursorResult = await wcdbService.openMessageCursor(sessionId, batchSize, ascending, beginTimestamp, endTimestamp)
+        const cursorResult = await wcdbService.openMessageCursor(sessionId, cursorBatchSize, ascending, beginTimestamp, endTimestamp)
         if (!cursorResult.success || !cursorResult.cursor) {
           console.error('[ChatService] 打开消息游标失败:', cursorResult.error)
           return { success: false, error: cursorResult.error || '打开消息游标失败' }
         }
 
-        state = { cursor: cursorResult.cursor, fetched: 0, batchSize, startTime, endTime, ascending }
+        state = { cursor: cursorResult.cursor, fetched: 0, batchSize: cursorBatchSize, startTime, endTime, ascending }
         this.messageCursors.set(sessionId, state)
         await this.trimMessageCursorStates(sessionId)
 
@@ -2030,19 +2069,53 @@ class ChatService {
         if (offset > 0) {
           console.warn(`[ChatService] 新游标需跳过 ${offset} 条消息（startTime=${startTime}, endTime=${endTime}）`)
           let skipped = 0
-          const maxSkipAttempts = Math.ceil(offset / batchSize) + 5 // 防止无限循环
+          const maxSkipAttempts = Math.ceil(offset / cursorBatchSize) + 5 // 防止无限循环
           let attempts = 0
+          let emptySkipBatchStreak = 0
           while (skipped < offset && attempts < maxSkipAttempts) {
             attempts++
             const skipBatch = await wcdbService.fetchMessageBatch(state.cursor)
             if (!skipBatch.success) {
               console.error('[ChatService] 跳过消息批次失败:', skipBatch.error)
+              await this.closeMessageCursorBySession(sessionId)
               return { success: false, error: skipBatch.error || '跳过消息失败' }
             }
             if (!skipBatch.rows || skipBatch.rows.length === 0) {
+              if (skipBatch.hasMore && emptySkipBatchStreak < 2) {
+                emptySkipBatchStreak += 1
+                console.warn(
+                  `[ChatService] 跳过遇到空批次，继续重试: streak=${emptySkipBatchStreak}, skipped=${skipped}/${offset}`
+                )
+                continue
+              }
+
+              // 部分会话在“新游标 + offset 跳过”路径会出现首批空数据但实际仍有消息，
+              // 回退到稳定的 direct-offset 路径避免误判到底。
+              if (skipped === 0 && startTime === 0 && endTime === 0 && !ascending) {
+                const fallbackResult = await this.getMessagesByOffsetStable(sessionId, offset, requestLimit)
+                if (fallbackResult.success && Array.isArray(fallbackResult.messages)) {
+                  await this.closeMessageCursorBySession(sessionId)
+                  releaseMessageCursorMutex?.()
+                  this.messageCacheService.set(sessionId, fallbackResult.messages)
+                  console.warn(
+                    `[ChatService] 游标跳过异常，已切换 direct-offset 兜底: session=${sessionId}, offset=${offset}, returned=${fallbackResult.messages.length}, hasMore=${fallbackResult.hasMore === true}`
+                  )
+                  return {
+                    success: true,
+                    messages: fallbackResult.messages,
+                    hasMore: fallbackResult.hasMore === true,
+                    nextOffset: Number.isFinite(fallbackResult.nextOffset)
+                      ? Math.floor(fallbackResult.nextOffset as number)
+                      : offset + fallbackResult.messages.length
+                  }
+                }
+              }
+
               console.warn(`[ChatService] 跳过时数据耗尽: skipped=${skipped}/${offset}`)
+              await this.closeMessageCursorBySession(sessionId)
               return { success: true, messages: [], hasMore: false, nextOffset: skipped }
             }
+            emptySkipBatchStreak = 0
 
             const count = skipBatch.rows.length
             // Check if we overshot the offset
@@ -2060,6 +2133,7 @@ class ChatService {
 
             if (!skipBatch.hasMore) {
               console.warn(`[ChatService] 跳过后无更多数据: skipped=${skipped}/${offset}`)
+              await this.closeMessageCursorBySession(sessionId)
               return { success: true, messages: [], hasMore: false, nextOffset: skipped }
             }
           }
@@ -2080,7 +2154,7 @@ class ChatService {
       const collected = await this.collectVisibleMessagesFromCursor(
         sessionId,
         state.cursor,
-        limit,
+        requestLimit,
         state.bufferedMessages as Record<string, any>[] | undefined
       )
       state.bufferedMessages = collected.bufferedRows
@@ -2202,6 +2276,54 @@ class ChatService {
     return null
   }
 
+  private async getMessagesByOffsetStable(
+    sessionId: string,
+    offset: number,
+    limit: number
+  ): Promise<{
+    success: boolean
+    messages?: Message[]
+    hasMore?: boolean
+    nextOffset?: number
+    rawRows?: number
+    filteredOut?: number
+    error?: string
+  }> {
+    const pageLimit = Math.max(1, Math.floor(limit || this.messageBatchDefault))
+    const safeOffset = Math.max(0, Math.floor(offset || 0))
+    const probeLimit = Math.min(500, pageLimit + 1)
+
+    const result = await wcdbService.getMessages(sessionId, probeLimit, safeOffset)
+    if (!result.success || !Array.isArray(result.messages)) {
+      return { success: false, error: result.error || '获取消息失败' }
+    }
+
+    const rawRows = result.messages as Record<string, any>[]
+    const hasMore = rawRows.length > pageLimit
+    const selectedRows = hasMore ? rawRows.slice(0, pageLimit) : rawRows
+    const mapped = this.mapRowsToMessages(selectedRows)
+    const visible = mapped.filter((msg) => this.isMessageVisibleForSession(sessionId, msg))
+    const outputMessages = (visible.length === 0 && mapped.length > 0)
+      ? mapped
+      : visible
+    if (visible.length === 0 && mapped.length > 0) {
+      console.warn(`[ChatService] getMessagesByOffsetStable 可见性过滤回退: session=${sessionId} mapped=${mapped.length}`)
+    }
+    const normalized = this.normalizeMessageOrder(outputMessages)
+    if (normalized.length > 0) {
+      await this.repairEmojiMessages(normalized)
+    }
+
+    return {
+      success: true,
+      messages: normalized,
+      hasMore,
+      nextOffset: safeOffset + selectedRows.length,
+      rawRows: selectedRows.length,
+      filteredOut: Math.max(0, mapped.length - visible.length)
+    }
+  }
+
 
   async getLatestMessages(sessionId: string, limit: number = this.messageBatchDefault): Promise<{ success: boolean; messages?: Message[]; hasMore?: boolean; nextOffset?: number; error?: string }> {
     try {
@@ -2210,31 +2332,22 @@ class ChatService {
         return { success: false, error: connectResult.error || '数据库未连接' }
       }
 
-      // 聊天页首屏优先走稳定路径：直接拉取固定窗口并做本地确定性排序，
-      // 避免游标首批在极端数据分布下出现不稳定边界。
-      const pageLimit = Math.max(1, Math.floor(limit || this.messageBatchDefault))
-      const probeLimit = Math.min(500, pageLimit + 1)
-      const result = await wcdbService.getMessages(sessionId, probeLimit, 0)
-      if (!result.success || !Array.isArray(result.messages)) {
-        return { success: false, error: result.error || '获取最新消息失败' }
+      // 聊天页首屏优先走稳定路径：固定 offset=0 的 direct-offset 读取。
+      const stableResult = await this.getMessagesByOffsetStable(sessionId, 0, limit)
+      if (!stableResult.success || !Array.isArray(stableResult.messages)) {
+        return { success: false, error: stableResult.error || '获取最新消息失败' }
       }
 
-      const rawRows = result.messages as Record<string, any>[]
-      const hasMore = rawRows.length > pageLimit
-      const selectedRows = hasMore ? rawRows.slice(0, pageLimit) : rawRows
-      const mapped = this.mapRowsToMessages(selectedRows)
-      const visible = mapped.filter((msg) => this.isMessageVisibleForSession(sessionId, msg))
-      const normalized = this.normalizeMessageOrder(visible)
-      await this.repairEmojiMessages(normalized)
-
       console.log(
-        `[ChatService] getLatestMessages(stable) session=${sessionId} rawRows=${rawRows.length} visibleMessagesReturned=${normalized.length} nextOffset=${selectedRows.length} hasMore=${hasMore}`
+        `[ChatService] getLatestMessages(stable) session=${sessionId} rawRows=${stableResult.rawRows || 0} visibleMessagesReturned=${stableResult.messages.length} filteredOut=${stableResult.filteredOut || 0} nextOffset=${stableResult.nextOffset || 0} hasMore=${stableResult.hasMore === true}`
       )
       return {
         success: true,
-        messages: normalized,
-        hasMore,
-        nextOffset: selectedRows.length
+        messages: stableResult.messages,
+        hasMore: stableResult.hasMore === true,
+        nextOffset: Number.isFinite(stableResult.nextOffset)
+          ? Math.floor(stableResult.nextOffset as number)
+          : stableResult.messages.length
       }
     } catch (e) {
       console.error('ChatService: 获取最新消息失败:', e)
@@ -2365,18 +2478,55 @@ class ChatService {
     const sortSeq = Number.isFinite(input.sortSeq) ? Math.max(0, Math.floor(input.sortSeq)) : 0
     const localType = Number.isFinite(input.localType) ? Math.floor(input.localType) : 0
     const senderUsername = this.encodeMessageKeySegment(input.senderUsername || '')
+    const dbPath = String(input.dbPath || '').trim()
     const dbName = String(input.dbName || '').trim() || (input.dbPath ? basename(input.dbPath, extname(input.dbPath)) : '')
     const tableName = String(input.tableName || '').trim()
+    const sourceScope = dbPath || dbName
 
-    if (localId > 0 && dbName && tableName) {
-      return `${this.encodeMessageKeySegment(dbName)}:${this.encodeMessageKeySegment(tableName)}:${localId}`
+    if (localId > 0 && sourceScope && tableName) {
+      return `${this.encodeMessageKeySegment(sourceScope)}:${this.encodeMessageKeySegment(tableName)}:${localId}`
+    }
+
+    if (localId > 0 && sourceScope) {
+      // 当底层未返回 table_name 时，避免使用 db:_:localId（会误并同库不同表的消息）。
+      return `local:${this.encodeMessageKeySegment(sourceScope)}:${localId}:${createTime}:${sortSeq}:${senderUsername}:${localType}`
     }
 
     if (serverId > 0) {
-      return `server:${serverId}:${createTime}:${sortSeq}:${localId}:${senderUsername}:${localType}`
+      const scopedServer = sourceScope ? `${this.encodeMessageKeySegment(sourceScope)}:${serverId}` : String(serverId)
+      return `server:${scopedServer}:${createTime}:${sortSeq}:${localId}:${senderUsername}:${localType}`
     }
 
-    return `fallback:${createTime}:${sortSeq}:${localId}:${senderUsername}:${localType}`
+    return `fallback:${this.encodeMessageKeySegment(sourceScope)}:${createTime}:${sortSeq}:${localId}:${senderUsername}:${localType}`
+  }
+
+  private logVisibilityAnomaly(sessionId: string, msg: Message): void {
+    const key = String(sessionId || '').trim() || '__unknown__'
+    const now = Date.now()
+    let state = this.visibilityAnomalyLogState.get(key)
+    if (!state || (now - state.windowStart) > this.visibilityAnomalyLogWindowMs) {
+      if (state && state.suppressed > 0) {
+        console.warn(
+          `[ChatService] 会话可见性异常日志已抑制: sessionId=${key}, suppressed=${state.suppressed}, windowMs=${this.visibilityAnomalyLogWindowMs}`
+        )
+      }
+      state = { windowStart: now, total: 0, suppressed: 0 }
+      this.visibilityAnomalyLogState.set(key, state)
+      if (this.visibilityAnomalyLogState.size > 256) {
+        const oldest = this.visibilityAnomalyLogState.keys().next()
+        if (!oldest.done) {
+          this.visibilityAnomalyLogState.delete(oldest.value)
+        }
+      }
+    }
+
+    state.total += 1
+    if (state.total <= this.visibilityAnomalyLogBurst) {
+      console.warn(`[ChatService] 检测到异常消息: sessionId=${sessionId}, senderUsername=${msg.senderUsername}, localId=${msg.localId}`)
+      return
+    }
+
+    state.suppressed += 1
   }
 
   private isMessageVisibleForSession(sessionId: string, msg: Message): boolean {
@@ -2390,7 +2540,7 @@ class ChatService {
     if (msg.isSend === 1) {
       return true
     }
-    console.warn(`[ChatService] 检测到异常消息: sessionId=${sessionId}, senderUsername=${msg.senderUsername}, localId=${msg.localId}`)
+    this.logVisibilityAnomaly(sessionId, msg)
     return false
   }
 
@@ -2421,10 +2571,12 @@ class ChatService {
     bufferedRows?: Record<string, any>[]
   }> {
     const visibleMessages: Message[] = []
+    const filteredCandidates: Message[] = []
     let queuedRows = Array.isArray(initialRows) ? initialRows.slice() : []
     let rawRowsConsumed = 0
     let filteredOut = 0
     let cursorMayHaveMore = queuedRows.length > 0
+    let emptyBatchStreak = 0
 
     while (visibleMessages.length < limit) {
       if (queuedRows.length === 0) {
@@ -2441,8 +2593,13 @@ class ChatService {
         const batchRows = Array.isArray(batch.rows) ? batch.rows as Record<string, any>[] : []
         cursorMayHaveMore = batch.hasMore === true
         if (batchRows.length === 0) {
+          if (cursorMayHaveMore && emptyBatchStreak < 2) {
+            emptyBatchStreak += 1
+            continue
+          }
           break
         }
+        emptyBatchStreak = 0
         queuedRows = batchRows
       }
 
@@ -2462,6 +2619,9 @@ class ChatService {
           }
         } else {
           filteredOut += 1
+          if (visibleMessages.length === 0 && filteredCandidates.length < limit) {
+            filteredCandidates.push(msg)
+          }
         }
       }
 
@@ -2478,8 +2638,19 @@ class ChatService {
       console.warn(`[ChatService] 过滤了 ${filteredOut} 条异常消息`)
     }
 
-    const normalized = this.normalizeMessageOrder(visibleMessages)
-    await this.repairEmojiMessages(normalized)
+    let outputMessages = visibleMessages
+    if (outputMessages.length === 0 && filteredCandidates.length > 0) {
+      // 回退策略：某些会话 sender_username 与 sessionId 可能不一致，避免整批被误过滤为 0 条。
+      outputMessages = filteredCandidates
+      console.warn(
+        `[ChatService] 会话可见性过滤触发回退: session=${sessionId} fallbackCount=${filteredCandidates.length}`
+      )
+    }
+
+    const normalized = this.normalizeMessageOrder(outputMessages)
+    if (normalized.length > 0) {
+      await this.repairEmojiMessages(normalized)
+    }
     return {
       success: true,
       messages: normalized,
@@ -6519,15 +6690,60 @@ class ChatService {
     return String(raw || '').replace(/\s+/g, '').trim()
   }
 
-  private shouldKeepSession(username: string): boolean {
+  private getSessionLocalType(row: Record<string, any>): number | undefined {
+    const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], Number.NaN)
+    return Number.isFinite(localType) ? Math.floor(localType) : undefined
+  }
+
+  private async loadContactLocalTypeMapForEnterpriseOpenim(usernames: string[]): Promise<Map<string, number>> {
+    const normalizedUsernames = Array.from(new Set(
+      (usernames || [])
+        .map((value) => String(value || '').trim())
+        .filter((value) => value && this.isEnterpriseOpenimUsername(value))
+    ))
+    const localTypeMap = new Map<string, number>()
+    if (normalizedUsernames.length === 0) {
+      return localTypeMap
+    }
+    try {
+      const contactResult = await wcdbService.getContactsCompact(normalizedUsernames)
+      if (!contactResult.success || !Array.isArray(contactResult.contacts)) {
+        return localTypeMap
+      }
+      for (const row of contactResult.contacts as Record<string, any>[]) {
+        const username = String(row.username || '').trim()
+        if (!username) continue
+        const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], Number.NaN)
+        if (!Number.isFinite(localType)) continue
+        localTypeMap.set(username, Math.floor(localType))
+      }
+    } catch {
+      return localTypeMap
+    }
+    return localTypeMap
+  }
+
+  private isEnterpriseOpenimUsername(username: string): boolean {
+    const lowered = String(username || '').trim().toLowerCase()
+    return lowered.includes('@openim') && !lowered.includes('@kefu.openim')
+  }
+
+  private isAllowedEnterpriseOpenimByLocalType(username: string, localType?: number): boolean {
+    if (!this.isEnterpriseOpenimUsername(username)) return false
+    return Number.isFinite(localType) && Math.floor(localType as number) === 5
+  }
+
+  private shouldKeepSession(username: string, localType?: number): boolean {
     if (!username) return false
     const lowered = username.toLowerCase()
     // 排除所有 placeholder 会话（包括折叠群）
     if (lowered.includes('@placeholder')) return false
     if (username.startsWith('gh_')) return false
 
+    if (lowered === 'weixin') return false
+
     const excludeList = [
-      'weixin', 'qqmail', 'fmessage', 'medianote', 'floatbottle',
+      'qqmail', 'fmessage', 'medianote', 'floatbottle',
       'newsapp', 'brandsessionholder', 'brandservicesessionholder',
       'notifymessage', 'opencustomerservicemsg', 'notification_messages',
       'userexperience_alarm', 'helper_folders',
@@ -6538,7 +6754,11 @@ class ChatService {
       if (username.startsWith(prefix) || username === prefix) return false
     }
 
-    if (username.includes('@kefu.openim') || username.includes('@openim')) return false
+    if (username.includes('@kefu.openim')) return false
+    // 全局约束：企业 openim 仅允许 localType=5。
+    if (this.isEnterpriseOpenimUsername(username)) {
+      return this.isAllowedEnterpriseOpenimByLocalType(username, localType)
+    }
     if (username.includes('service_')) return false
 
     return true
@@ -8618,6 +8838,7 @@ class ChatService {
       let groupSessionIds = Array.isArray(options?.groupSessionIds)
         ? options!.groupSessionIds!.map((value) => String(value || '').trim()).filter(Boolean)
         : []
+      const privateSessionLocalTypeMap = new Map<string, number>()
       const hasExplicitGroupScope = Array.isArray(options?.groupSessionIds)
         && options!.groupSessionIds!.some((value) => String(value || '').trim().length > 0)
 
@@ -8626,26 +8847,46 @@ class ChatService {
         if (!sessionsResult.success || !Array.isArray(sessionsResult.sessions)) {
           return { success: false, error: sessionsResult.error || '读取会话列表失败' }
         }
+        const openimLocalTypeMap = await this.loadContactLocalTypeMapForEnterpriseOpenim(
+          (sessionsResult.sessions as Array<Record<string, any>>).map((session) => String(session.username || session.user_name || '').trim())
+        )
         for (const session of sessionsResult.sessions as Array<Record<string, any>>) {
           const sessionId = String(session.username || session.user_name || '').trim()
           if (!sessionId) continue
+          let sessionLocalType = this.getSessionLocalType(session)
+          if (!Number.isFinite(sessionLocalType) && this.isEnterpriseOpenimUsername(sessionId)) {
+            sessionLocalType = openimLocalTypeMap.get(sessionId)
+          }
+          if (typeof sessionLocalType === 'number' && Number.isFinite(sessionLocalType)) {
+            privateSessionLocalTypeMap.set(sessionId, sessionLocalType)
+          }
           const sessionLastTs = this.normalizeTimestampSeconds(
             Number(session.lastTimestamp || session.sortTimestamp || 0)
           )
           if (sessionId.endsWith('@chatroom')) {
             groupSessionIds.push(sessionId)
           } else {
-            if (!this.shouldKeepSession(sessionId)) continue
+            if (!this.shouldKeepSession(sessionId, sessionLocalType)) continue
             if (begin > 0 && sessionLastTs > 0 && sessionLastTs < begin) continue
             privateSessionIds.push(sessionId)
           }
         }
       }
 
+      const unresolvedOpenimPrivateSessionIds = privateSessionIds.filter((value) =>
+        this.isEnterpriseOpenimUsername(value) && !privateSessionLocalTypeMap.has(value)
+      )
+      if (unresolvedOpenimPrivateSessionIds.length > 0) {
+        const fallbackMap = await this.loadContactLocalTypeMapForEnterpriseOpenim(unresolvedOpenimPrivateSessionIds)
+        for (const [username, localType] of fallbackMap.entries()) {
+          privateSessionLocalTypeMap.set(username, localType)
+        }
+      }
+
       privateSessionIds = Array.from(new Set(
         privateSessionIds
           .map((value) => String(value || '').trim())
-          .filter((value) => value && !value.endsWith('@chatroom') && this.shouldKeepSession(value))
+          .filter((value) => value && !value.endsWith('@chatroom') && this.shouldKeepSession(value, privateSessionLocalTypeMap.get(value)))
       ))
       groupSessionIds = Array.from(new Set(
         groupSessionIds
